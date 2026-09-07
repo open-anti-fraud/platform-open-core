@@ -1,0 +1,310 @@
+import datetime
+import base64
+from enum import Enum
+from typing import Optional, List
+from uuid import UUID
+
+import strawberry
+import strawberry_django
+from strawberry import ID, auto
+from strawberry.arguments import UNSET
+
+from data_domain.managers import ActivityManager, SampleManager
+from data_domain.models import Sample, Activity, BlobMeta, Blob
+from platform_lib.types import JSON, FilterLookupCustom, CustomBinaryType
+from platform_lib.managers import ActivityProcessManager
+from platform_lib.utils import get_collection, isoformat_time, FilterByWorkspaceMixin
+from label_domain.api.v2.types import ProfileGroupOutput
+
+from django.apps import apps
+from django.db.models import Q
+
+
+profile_model = apps.get_model('person_domain', 'Profile')
+person_model = apps.get_model('person_domain', 'Person')
+agent_model = apps.get_model('collector_domain', 'Agent')
+
+
+@strawberry.django.type(Blob)
+class BlobType:
+    id: auto
+    creation_date: auto
+    last_modified: auto
+
+    @strawberry.field(description="Binary data encoded in base64")
+    def data(self) -> Optional[CustomBinaryType]:
+        return self.data
+
+
+@strawberry.django.type(BlobMeta)
+class BlobMetaType:
+    id: auto
+    blob: BlobType
+    meta: JSON
+    creation_date: auto
+    last_modified: auto
+
+    @strawberry.field(description="Type of binary data")
+    def type(self) -> Optional[str]:
+        return self.meta.get('type', '')
+
+
+@strawberry_django.filters.filter(Activity)
+class ActivityFilter:
+    id: FilterLookupCustom[ID] = strawberry_django.field(default=UNSET, description="Filtering activities by ids")
+    creation_date: FilterLookupCustom[datetime.datetime] = strawberry_django.field(
+        default=UNSET,
+        description="Filtering activities by creation date"
+    )
+    last_modified: FilterLookupCustom[datetime.datetime] = strawberry_django.field(
+        default=UNSET,
+        description="Filtering activities by date of last modification"
+    )
+    profile_id: Optional[UUID] = strawberry_django.field(
+        default=UNSET,
+        description="Filtering profile activities by profile id"
+    )
+
+    def filter_profile_id(self, queryset):
+        if self.profile_id is None:
+            return queryset
+        else:
+            return queryset.filter(person__profile__id=self.profile_id)
+
+
+@strawberry_django.ordering.order(Activity)
+class ActivityOrdering:
+    id: auto
+    creation_date: auto
+    last_modified: auto
+
+
+@strawberry.enum
+class ActivityType(Enum):
+    PROGRESS = 1
+    FINALIZED = 2
+    FAILED = 3
+
+
+@strawberry_django.type(Activity, description="""
+An Activity is an object that stores grouped information
+about some completed processes associated with a Profile, Camera and/or Location
+""")
+class ActivityOutput(FilterByWorkspaceMixin):
+    description_name = "activities"
+
+    id: ID = strawberry.field(description="Activity ID")
+    data: JSON = strawberry.field(description="A set of processes that occurred within the same Activity")
+    creation_date: datetime.datetime = strawberry.field(
+        description="Activity creation date in ISO 8601 format with time zone"
+    )
+    last_modified: datetime.datetime = strawberry.field(
+        description="Activity creation date in ISO 8601 format with time zone"
+    )
+
+    @strawberry.field(description="ID of the Camera object that captured the Activity")
+    def camera_id(root) -> ID:
+        return root.camera.id
+
+    @strawberry.field(description="Title of Agent that created the Activity")
+    def agent_title(root) -> Optional[str]:
+        agent = agent_model.objects.all(Q(cameras__id=root.camera.id))
+
+        if agent:
+            return agent.first().info.get('title')
+
+        return None
+
+    @strawberry.field(description="Title of Camera that captured the Activity")
+    def camera_title(root) -> Optional[str]:
+        return root.camera.info.get('title')
+
+    @strawberry.field(description='Id of the best shot of any part of a person, depending on the subject'
+                                  ' it is requested from. For example: best shot of the face, body, etc.')
+    def best_shot_id(root) -> Optional[ID]:
+        return (ActivityManager.get_best_shot_ids(root) or [None])[0]  # noqa
+
+    @strawberry.field(description="ID of the Profile object associated with the Activity")
+    def profile_id(root) -> Optional[ID]:
+        try:
+            return root.person.profile.id
+        except AttributeError:
+            return None
+
+    @strawberry.field(description="ID of the Location object where the Activity occurred")
+    def location_id(root) -> Optional[str]:
+        camera_id = root.camera.id
+        camera = apps.get_model('collector_domain', 'Camera')
+        camera_obj = camera.objects.filter(id=camera_id)
+        location = camera_obj.first().locations.first() if camera_obj.exists() else None
+
+        return getattr(location, 'id', None)
+
+    @strawberry.field(description="Activity start time in ISO 8601 format with time zone")
+    def time_start(root) -> Optional[str]:
+        activity_time = ActivityProcessManager(root.data).get_human_timeinterval()[0]
+        return isoformat_time(activity_time) if activity_time else None
+
+    @strawberry.field(description="Activity end time in ISO 8601 format with time zone")
+    def time_end(root) -> Optional[str]:
+        activity_time = ActivityProcessManager(root.data).get_human_timeinterval()[1]
+        return isoformat_time(activity_time) if activity_time else None
+
+    @strawberry.field(description="Activity status")
+    def status(root) -> ActivityType:
+        return root.status
+
+
+@strawberry.type(description="""
+A Sample is an object that stores the image of a person's face and/or
+a corresponding biometric template that is used for face recognition
+""")
+class SampleOutput:
+    id: ID = strawberry.field(description="Sample ID")
+
+    creation_date: Optional[datetime.datetime] = strawberry.field(
+        description="Sample creation date in ISO 8601 format with time zone", default=None
+    )
+    last_modified: Optional[datetime.datetime] = strawberry.field(
+        description="Sample creation date in ISO 8601 format with time zone", default=None
+    )
+
+    @strawberry.field(description="Image, biometric template and/or detection result in the Sample format")
+    def data(self) -> JSON:
+        return self.meta
+
+    @strawberry.field(description="Template associated with sample")
+    def template(self) -> Optional[BlobMetaType]:
+        template_version = self.workspace.config["template_version"]
+        template_id = SampleManager.get_template_id(self.meta, template_version)
+        return BlobMeta.objects.get(id=template_id)
+
+
+@strawberry.type
+class MatchResult:
+    distance: float
+    fa_r: float = strawberry.field(name="faR")
+    fr_r: float = strawberry.field(name="frR")
+    score: float
+
+
+@strawberry.type
+class ProfileOutputData:
+    id: ID
+    info: JSON
+
+    last_modified: datetime.datetime = strawberry.field(description='Profile last modified date in ISO 8601 UTC format')
+    creation_date: datetime.datetime = strawberry.field(description='Profile creation date in ISO 8601 UTC format')
+
+    @strawberry.field(description="ID of the Person object associated with the profile")
+    def person_id(self) -> ID:
+        return self.person.id
+
+    @strawberry.field(description="Main Sample object for profile")
+    def main_sample(self) -> Optional[SampleOutput]:
+        return self.samples.get(id=self.info.get("main_sample_id"))
+
+    @strawberry.field(description="Avatar id for profile")
+    def avatar(self) -> Optional[ID]:
+        return self.info.get("avatar_id")
+
+    @strawberry.field(description="Groups the profile belongs to")
+    def profile_groups(self) -> List[ProfileGroupOutput]:
+        return self.profile_groups.all()
+
+
+@strawberry.type
+class PersonSearchResult:
+    @strawberry.field
+    def sample(root) -> Optional[SampleOutput]:
+        person_id = root.get('vector_id')
+        person = profile_model.objects.filter(person_id=person_id).first()
+        if person and (sample_id := person.info.get('main_sample_id')):
+            return Sample.objects.get(id=sample_id)
+
+    @strawberry.field
+    def profile(root) -> Optional[ProfileOutputData]:
+        person_id = root.get('vector_id')
+        return profile_model.objects.filter(person_id=person_id).first()
+
+    @strawberry.field
+    def match_result(root) -> MatchResult:
+        return MatchResult(fa_r=root['fa_r'], fr_r=root['fr_r'], score=root['score'], distance=root['distance'])
+
+
+@strawberry.type
+class ActivitySearchResult:
+    activity: Optional[ActivityOutput]
+
+    @strawberry.field
+    def activity(root) -> Optional[ActivityOutput]:
+        activity_id = root.get('activityId')
+        return Activity.objects.filter(id=activity_id).first()
+
+    @strawberry.field
+    def match_result(root) -> MatchResult:
+        result = root.get('matchResult')
+        if result.get('faR') is not None:
+            result['fa_r'] = result.pop('faR')
+            result['fr_r'] = result.pop('frR')
+        return MatchResult(**result)  # noqa
+
+
+@strawberry.type
+class SearchType:
+    @strawberry.field
+    def template(root) -> Optional[str]:
+        return root.get('template')
+
+    @strawberry.field
+    def search_result(root) -> Optional[List[PersonSearchResult]]:
+        return root.get('search_result')
+
+    @strawberry.field
+    def source_type(root) -> str:
+        return root.get('source_type')
+
+    @strawberry.field
+    def source_value(root) -> str:
+        return root.get('source_value')
+
+    @strawberry.field
+    def source_value(root) -> str:
+        if isinstance(root.get('source_value'), str):
+            return root.get('source_value')
+        else:
+            return base64.b64encode(root.get('source_value')).decode('utf-8')
+
+    @strawberry.field
+    def message(root) -> Optional[str]:
+        return root.get('message')
+
+
+@strawberry.type
+class ActivitySearchType:
+    @strawberry.field
+    def template(root) -> str:
+        return root.get('template')
+
+    @strawberry.field
+    def search_result(root) -> List[ActivitySearchResult]:
+        return root.get('searchResult')
+
+
+@strawberry.enum
+class MultifacePolicy(Enum):
+    ALLOW_MULTIFACE = "ALLOW_MULTIFACE"
+    NOT_ALLOW_MULTIFACE = "NOT_ALLOW_MULTIFACE"
+    BEST_QUALITY_FACE = "BEST_QUALITY_FACE"
+
+
+ActivityCollection = strawberry.type(get_collection(ActivityOutput, 'ActivityCollection'),
+                                     description="Filtered activity collection and total activity count")
+
+
+SampleCollection = strawberry.type(
+    get_collection(SampleOutput, "SampleCollection"),
+    description="Collection of samples"
+)
+
+sample_map = {'creationDate': 'creation_date', 'lastModified': 'last_modified'}
